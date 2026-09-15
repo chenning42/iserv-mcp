@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import inspect
 import json
 import re
+import socket
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
@@ -13,6 +15,8 @@ from html import unescape
 from urllib.parse import urljoin, urlparse, urlunparse
 
 import aiohttp
+from aiohttp.abc import AbstractCookieJar, AbstractResolver, ResolveResult
+from aiohttp.typedefs import LooseHeaders
 
 from .const import CONNECTION_TIMEOUT, REQUEST_TIMEOUT
 
@@ -38,6 +42,19 @@ class DownloadedFile:
     content_disposition: str
 
 
+@dataclass(frozen=True)
+class _RequestResult:
+    """Response data collected while its aiohttp context is still open."""
+
+    status: int
+    url: str
+    headers: dict[str, str]
+    body: str | bytes | None
+    history: tuple[str, ...]
+    content_length: int | None
+    status_error: aiohttp.ClientError | None
+
+
 class TimetableResult(str):
     """Parser-compatible timetable text with the complete server JSON attached."""
 
@@ -59,37 +76,213 @@ class TimetableResult(str):
 
 
 def validate_url(url: str) -> bool:
-    """Validate that a URL starts with https:// and has a valid host component.
+    """Return whether ``url`` is a safe HTTPS iServ base URL.
 
-    Args:
-        url: The URL string to validate.
-
-    Returns:
-        True if the URL starts with "https://" and has a non-empty host with at
-        least one dot (indicating a valid domain), False otherwise.
+    This is deliberately a synchronous, syntax-level check. Hostname DNS is
+    checked asynchronously immediately before requests by :class:`IServClient`.
     """
-    if not isinstance(url, str):
+    try:
+        _validated_base_url(url)
+    except (TypeError, ValueError):
         return False
+    return True
 
-    if not url.startswith("https://"):
-        return False
 
+def canonical_origin(url: str) -> str:
+    """Return the canonical HTTPS origin (scheme, host and effective port)."""
+    return _validated_base_url(url)[3]
+
+
+def _validated_base_url(url: str) -> tuple[object, str, int, str]:
+    """Parse and validate a configured base URL.
+
+    The returned tuple contains the parsed URL, canonical hostname, effective
+    port, and canonical origin. ``object`` keeps this helper independent of the
+    private urllib parse result type in the public API.
+    """
+    if not isinstance(url, str) or not url.strip():
+        raise ValueError("IServ URL must be a non-empty HTTPS URL")
     try:
         parsed = urlparse(url)
+        port = parsed.port
+        hostname = parsed.hostname
+    except ValueError as err:
+        raise ValueError("IServ URL has an invalid host or port") from err
+
+    if parsed.scheme.casefold() != "https":
+        raise ValueError("IServ URL must use HTTPS")
+    if not parsed.netloc or hostname is None:
+        raise ValueError("IServ URL must contain a host")
+    if parsed.username is not None or parsed.password is not None or "@" in parsed.netloc:
+        raise ValueError("IServ URL must not contain userinfo")
+    if parsed.fragment:
+        raise ValueError("IServ URL must not contain a fragment")
+    if parsed.netloc.endswith(":"):
+        raise ValueError("IServ URL has an invalid host or port")
+    if port is not None and not 1 <= port <= 65535:
+        raise ValueError("IServ URL has an invalid port")
+
+    host = _canonical_hostname(hostname)
+    if not host or ("." not in host and not _is_ip_literal(host)):
+        raise ValueError("IServ URL must contain a fully-qualified host")
+    if _is_obviously_local_hostname(host):
+        raise ValueError("IServ URL must not target a local hostname")
+    if _is_ip_literal(host):
+        if not _is_safe_ip(ipaddress.ip_address(host)):
+            raise ValueError("IServ URL must not target a private or reserved IP")
+    elif host.replace(".", "").isdigit():
+        raise ValueError("IServ URL has an invalid numeric host")
+
+    effective_port = port or 443
+    origin_host = f"[{host}]" if ":" in host else host
+    origin = f"https://{origin_host}"
+    if effective_port != 443:
+        origin += f":{effective_port}"
+    return parsed, host, effective_port, origin
+
+
+def _canonical_hostname(host: str) -> str:
+    """Canonicalize a hostname or IP address for origin comparisons."""
+    if not host or host != host.strip() or any(char.isspace() for char in host):
+        raise ValueError("IServ URL has an invalid hostname")
+    host = host.casefold().rstrip(".")
+    if not host or "%" in host:
+        raise ValueError("IServ URL has an invalid hostname")
+    try:
+        return ipaddress.ip_address(host).compressed.casefold()
+    except ValueError:
+        try:
+            ascii_host = host.encode("idna").decode("ascii").casefold()
+        except UnicodeError as err:
+            raise ValueError("IServ URL has an invalid hostname") from err
+        labels = ascii_host.split(".")
+        if (
+            len(ascii_host) > 253
+            or any(
+                not label
+                or len(label) > 63
+                or label[0] == "-"
+                or label[-1] == "-"
+                or not re.fullmatch(r"[a-z0-9-]+", label)
+                for label in labels
+            )
+        ):
+            raise ValueError("IServ URL has an invalid hostname")
+        return ascii_host
+
+
+def _is_ip_literal(host: str) -> bool:
+    try:
+        ipaddress.ip_address(host)
     except ValueError:
         return False
-
-    # Must have a non-empty hostname
-    if not parsed.hostname:
-        return False
-
-    # Host must contain at least one dot (e.g., "school.iserv.de")
-    # or be "localhost" for testing purposes
-    host = parsed.hostname
-    if "." not in host and host != "localhost":
-        return False
-
     return True
+
+
+def _is_safe_ip(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    """Allow only globally routable addresses for configured destinations."""
+    return address.is_global
+
+
+def _is_obviously_local_hostname(host: str) -> bool:
+    return host in {"localhost", "localhost.localdomain", "ip6-localhost"} or host.endswith(
+        (".localhost", ".local")
+    )
+
+
+class _ValidatedResolver(AbstractResolver):
+    """Resolve a hostname once and return only the validated addresses."""
+
+    def __init__(self, backend: AbstractResolver | None = None) -> None:
+        self._backend = backend
+
+    async def resolve(
+        self, host: str, port: int = 0, family: socket.AddressFamily = socket.AF_INET
+    ) -> list[ResolveResult]:
+        if self._backend is not None:
+            backend_results = await self._backend.resolve(host, port, family=family)
+            addresses = [
+                (
+                    result["family"],
+                    socket.SOCK_STREAM,
+                    result["proto"],
+                    result["hostname"],
+                    (result["host"], result["port"]),
+                )
+                for result in backend_results
+            ]
+        else:
+            loop = asyncio.get_running_loop()
+            addresses = await loop.getaddrinfo(
+                host,
+                port,
+                family=family,
+                type=socket.SOCK_STREAM,
+                proto=socket.IPPROTO_TCP,
+            )
+
+        resolved: list[ResolveResult] = []
+        seen: set[tuple[int, str]] = set()
+        for address_family, _type, proto, _canonname, sockaddr in addresses:
+            if not sockaddr:
+                continue
+            try:
+                address = ipaddress.ip_address(sockaddr[0])
+            except ValueError as err:
+                raise ValueError("iServ DNS returned an invalid IP address") from err
+            if not _is_safe_ip(address):
+                raise ValueError("iServ host resolves to a private or reserved IP")
+            key = (address_family, address.compressed)
+            if key in seen:
+                continue
+            seen.add(key)
+            resolved.append(
+                {
+                    "hostname": host,
+                    "host": address.compressed,
+                    "port": port,
+                    "family": address_family,
+                    "proto": proto,
+                    "flags": 0,
+                }
+            )
+        if not resolved:
+            raise OSError(f"Could not resolve iServ host {host}")
+        return resolved
+
+    async def close(self) -> None:
+        """Release resolver resources (the resolver has no persistent state)."""
+
+
+class _SecureTCPConnector(aiohttp.TCPConnector):
+    """TCP connector whose resolver result is the address actually connected."""
+
+    _is_iserv_secure = True
+
+    def __init__(self, backend_resolver: AbstractResolver | None = None) -> None:
+        super().__init__(
+            resolver=_ValidatedResolver(backend_resolver),
+            use_dns_cache=False,
+            force_close=True,
+        )
+        # TCPConnector does not own an explicitly supplied resolver. This one
+        # is created with the connector and must therefore be closed with it.
+        self._resolver_owner = True
+
+
+def create_secure_session(
+    *,
+    cookie_jar: AbstractCookieJar | None = None,
+    headers: LooseHeaders | None = None,
+    backend_resolver: AbstractResolver | None = None,
+) -> aiohttp.ClientSession:
+    """Create a session using the validated resolver/connector."""
+    connector = _SecureTCPConnector(backend_resolver)
+    return aiohttp.ClientSession(
+        connector=connector,
+        cookie_jar=cookie_jar,
+        headers=headers,
+    )
 
 
 class IServClient:
@@ -105,7 +298,7 @@ class IServClient:
 
     def __init__(
         self,
-        session: aiohttp.ClientSession,
+        session: aiohttp.ClientSession | object | None,
         base_url: str,
         username: str,
         password: str,
@@ -114,13 +307,20 @@ class IServClient:
         """Initialize the iServ client.
 
         Args:
-            session: An aiohttp ClientSession for making HTTP requests.
+            session: An aiohttp ClientSession for making HTTP requests. If a
+                regular aiohttp session is supplied, it is left untouched and
+                a private secure session is used for the requests. Test
+                doubles are used directly. If ``None`` is supplied, a secure
+                session is created lazily and owned by this client.
             base_url: The base URL of the iServ server (e.g., "https://school.iserv.de").
             username: The iServ username.
             password: The iServ password.
         """
+        self._provided_session = session
         self._session = session
+        self._owned_session: aiohttp.ClientSession | None = None
         self._base_url = _normalize_base_url(base_url)
+        self._origin = canonical_origin(self._base_url)
         self._username = username
         self._password = password
         self._debug_callback = debug_callback
@@ -174,18 +374,156 @@ class IServClient:
 
         raise AuthenticationError("Too many iServ authentication redirects")
 
+    async def _validate_request_url(self, url: str) -> None:
+        """Validate URL syntax and ensure the request stays same-origin."""
+        try:
+            _parsed, _host, _port, origin = _validated_base_url(url)
+        except (TypeError, ValueError) as err:
+            raise ValueError(f"Unsafe iServ request URL: {err}") from err
+        if origin != self._origin:
+            raise ValueError("iServ request URL must stay on the configured origin")
+
+    async def _ensure_session(self) -> aiohttp.ClientSession | object:
+        """Return a session whose connector performs the validated lookup."""
+        if self._session is None:
+            self._session = create_secure_session()
+            self._owned_session = self._session
+        elif isinstance(self._session, aiohttp.ClientSession):
+            connector = self._session.connector
+            if not getattr(connector, "_is_iserv_secure", False):
+                # Do not mutate or close a caller-owned session. Sharing its
+                # cookie jar preserves the authenticated state while the
+                # private session enforces DNS validation at connect time.
+                self._session = create_secure_session(
+                    cookie_jar=self._session.cookie_jar,
+                    headers=self._session.headers,
+                    backend_resolver=getattr(connector, "_resolver", None),
+                )
+                self._owned_session = self._session
+        return self._session
+
+    async def close(self) -> None:
+        """Close only a session/connector created by this client."""
+        if self._owned_session is not None:
+            await self._owned_session.close()
+            self._owned_session = None
+            self._session = self._provided_session
+
+    def _request_context(
+        self,
+        method: str,
+        url: str,
+        **kwargs: object,
+    ) -> object:
+        """Call the narrowest session method supported by aiohttp/test doubles."""
+        method_name = method.casefold()
+        request_method = getattr(self._session, method_name, None)
+        if callable(request_method) and method_name in {"get", "post"}:
+            return request_method(url, **kwargs)
+        return self._session.request(method, url, **kwargs)
+
+    async def _request(
+        self,
+        method: str,
+        url: str,
+        *,
+        timeout: aiohttp.ClientTimeout,
+        data: dict[str, str] | None = None,
+        json_payload: dict[str, object] | None = None,
+        params: dict[str, str] | None = None,
+        read_mode: str = "text",
+        max_bytes: int | None = None,
+        max_redirects: int = 10,
+    ) -> _RequestResult:
+        """Perform a request while allowing only same-origin redirects.
+
+        Redirects are handled explicitly because aiohttp's automatic redirect
+        handling would send a POST body before the caller can inspect the new
+        origin. A 301/302/303 POST becomes a same-origin GET; 307/308 preserve
+        the method and body.
+        """
+        current_method = method.upper()
+        current_url = url
+        current_data = data
+        current_json = json_payload
+        current_params = params
+        history: list[str] = []
+
+        await self._ensure_session()
+        await self._validate_request_url(current_url)
+        for _ in range(max_redirects + 1):
+            kwargs: dict[str, object] = {
+                "timeout": timeout,
+                "allow_redirects": False,
+            }
+            if current_data is not None:
+                kwargs["data"] = current_data
+            if current_json is not None:
+                kwargs["json"] = current_json
+            if current_params is not None:
+                kwargs["params"] = current_params
+
+            async with self._request_context(current_method, current_url, **kwargs) as response:
+                response_url = str(getattr(response, "url", current_url))
+                await self._validate_request_url(response_url)
+                self._debug_response(current_method, response)
+                location = response.headers.get("Location")
+                if response.status in (301, 302, 303, 307, 308) and location:
+                    next_url = urljoin(response_url, location)
+                    # This check happens before a second request is opened.
+                    await self._validate_request_url(next_url)
+                    history.append(response_url)
+                    if response.status in (301, 302, 303) and current_method not in {"GET", "HEAD"}:
+                        current_method = "GET"
+                        current_data = None
+                        current_json = None
+                    current_url = next_url
+                    current_params = None
+                    continue
+
+                body: str | bytes | None = None
+                content_length = getattr(response, "content_length", None)
+                status_error: aiohttp.ClientError | None = None
+                try:
+                    await _raise_for_status(response)
+                except aiohttp.ClientError as err:
+                    status_error = err
+                if read_mode == "text":
+                    body = await _read_response_text(response)
+                elif read_mode == "bytes":
+                    if content_length is not None and max_bytes is not None and content_length > max_bytes:
+                        raise ValueError(f"Attachment exceeds the {max_bytes}-byte limit")
+                    chunks: list[bytes] = []
+                    size = 0
+                    async for chunk in response.content.iter_chunked(64 * 1024):
+                        size += len(chunk)
+                        if max_bytes is not None and size > max_bytes:
+                            raise ValueError(f"Attachment exceeds the {max_bytes}-byte limit")
+                        chunks.append(chunk)
+                    body = b"".join(chunks)
+                return _RequestResult(
+                    status=response.status,
+                    url=response_url,
+                    headers=dict(response.headers),
+                    body=body,
+                    history=tuple(history),
+                    content_length=content_length,
+                    status_error=status_error,
+                )
+
+        raise CannotConnect(f"Too many redirects while requesting {url}")
+
     async def _get_page(self, url: str) -> tuple[str, str]:
         """Fetch one authentication page and return its final URL and body."""
         try:
-            timeout = aiohttp.ClientTimeout(total=CONNECTION_TIMEOUT)
-            async with self._session.get(
+            result = await self._request(
+                "GET",
                 url,
-                timeout=timeout,
-                allow_redirects=True,
-            ) as response:
-                self._debug_response("GET", response)
-                await _raise_for_status(response)
-                return str(response.url), await _read_response_text(response)
+                timeout=aiohttp.ClientTimeout(total=CONNECTION_TIMEOUT),
+            )
+            if result.status_error is not None:
+                raise result.status_error
+            return result.url, str(result.body or "")
         except asyncio.TimeoutError as err:
             raise CannotConnect(
                 f"Connection to {self._base_url} timed out"
@@ -200,41 +538,40 @@ class IServClient:
     ) -> bool:
         """Authenticate against one iServ login endpoint."""
         try:
-            timeout = aiohttp.ClientTimeout(total=CONNECTION_TIMEOUT)
-            async with self._session.post(
+            result = await self._request(
+                "POST",
                 url,
                 data=payload,
-                timeout=timeout,
-                allow_redirects=True,
-            ) as response:
-                self._debug_response("POST", response)
-                if response.status in (401, 403):
-                    self._authenticated = False
-                    raise AuthenticationError(
-                        f"Authentication failed with status {response.status}"
-                    )
-                await _raise_for_status(response)
-                response_url = str(response.url)
-                response_body = await _read_response_text(response)
+                timeout=aiohttp.ClientTimeout(total=CONNECTION_TIMEOUT),
+            )
+            if result.status in (401, 403):
+                self._authenticated = False
+                raise AuthenticationError(
+                    f"Authentication failed with status {result.status}"
+                )
+            if result.status_error is not None:
+                raise result.status_error
+            response_url = result.url
+            response_body = str(result.body or "")
+            if _is_login_page(response_body):
+                self._authenticated = False
+                raise AuthenticationError("iServ returned the login page")
+
+            for _ in range(3):
+                refresh_url = _meta_refresh_url(response_body, response_url)
+                if refresh_url is None:
+                    break
+                response_url, response_body = await self._get_page(refresh_url)
                 if _is_login_page(response_body):
                     self._authenticated = False
                     raise AuthenticationError("iServ returned the login page")
 
-                for _ in range(3):
-                    refresh_url = _meta_refresh_url(response_body, response_url)
-                    if refresh_url is None:
-                        break
-                    response_url, response_body = await self._get_page(refresh_url)
-                    if _is_login_page(response_body):
-                        self._authenticated = False
-                        raise AuthenticationError("iServ returned the login page")
+            if "/iserv/auth/auth" in response_url:
+                self._authenticated = False
+                raise AuthenticationError("iServ authentication did not complete")
 
-                if "/iserv/auth/auth" in response_url:
-                    self._authenticated = False
-                    raise AuthenticationError("iServ authentication did not complete")
-
-                self._authenticated = True
-                return True
+            self._authenticated = True
+            return True
 
         except AuthenticationError:
             raise
@@ -399,31 +736,29 @@ class IServClient:
             CannotConnect: If the connection times out or fails.
         """
         try:
-            timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
-            async with self._session.get(
+            result = await self._request(
+                "GET",
                 url,
                 params=params,
-                timeout=timeout,
-            ) as response:
-                self._debug_response("GET", response)
-                if response.status in unavailable_statuses:
-                    raise _EndpointUnavailable
-                if response.status in (401, 403):
-                    self._authenticated = False
-                    raise AuthenticationError(
-                        "Session expired or authentication required"
-                    )
-                if _is_auth_redirect(response):
-                    self._authenticated = False
-                    raise AuthenticationError("iServ redirected to authentication")
+                timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
+            )
+            if result.status in unavailable_statuses:
+                raise _EndpointUnavailable
+            if result.status in (401, 403):
+                self._authenticated = False
+                raise AuthenticationError("Session expired or authentication required")
+            if _is_auth_redirect(result):
+                self._authenticated = False
+                raise AuthenticationError("iServ redirected to authentication")
+            if result.status_error is not None:
+                raise result.status_error
 
-                await _raise_for_status(response)
-                response_body = await _read_response_text(response)
-                if _is_login_page(response_body):
-                    self._authenticated = False
-                    raise AuthenticationError("iServ returned the login page")
+            response_body = str(result.body or "")
+            if _is_login_page(response_body):
+                self._authenticated = False
+                raise AuthenticationError("iServ returned the login page")
 
-                return response_body
+            return response_body
 
         except (AuthenticationError, _EndpointUnavailable):
             raise
@@ -531,35 +866,33 @@ class IServClient:
     ) -> DownloadedFile:
         """Download a same-origin iServ file without exposing session cookies."""
         target = urljoin(f"{self._base_url}/", href)
-        base = urlparse(self._base_url)
         parsed = urlparse(target)
-        if (parsed.scheme, parsed.netloc) != (base.scheme, base.netloc):
-            raise ValueError("Attachment URL must use the configured iServ origin")
+        await self._validate_request_url(target)
         if not parsed.path.startswith("/iserv/"):
             raise ValueError("Attachment URL must stay below /iserv/")
         try:
-            timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
-            async with self._session.get(target, timeout=timeout) as response:
-                self._debug_response("GET", response)
-                if response.status in (401, 403) or _is_auth_redirect(response):
-                    self._authenticated = False
-                    raise AuthenticationError("Authentication required for attachment")
-                await _raise_for_status(response)
-                declared = response.content_length
-                if declared is not None and declared > max_bytes:
-                    raise ValueError(f"Attachment exceeds the {max_bytes}-byte limit")
-                chunks: list[bytes] = []
-                size = 0
-                async for chunk in response.content.iter_chunked(64 * 1024):
-                    size += len(chunk)
-                    if size > max_bytes:
-                        raise ValueError(f"Attachment exceeds the {max_bytes}-byte limit")
-                    chunks.append(chunk)
-                return DownloadedFile(
-                    content=b"".join(chunks),
-                    content_type=response.headers.get("Content-Type", "application/octet-stream"),
-                    content_disposition=response.headers.get("Content-Disposition", ""),
-                )
+            result = await self._request(
+                "GET",
+                target,
+                timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
+                read_mode="bytes",
+                max_bytes=max_bytes,
+            )
+            if result.status in (401, 403) or _is_auth_redirect(result):
+                self._authenticated = False
+                raise AuthenticationError("Authentication required for attachment")
+            if result.status_error is not None:
+                raise result.status_error
+            final_path = urlparse(result.url).path
+            if not final_path.startswith("/iserv/"):
+                raise ValueError("Attachment URL must stay below /iserv/")
+            if not isinstance(result.body, bytes):
+                raise CannotConnect("iServ returned an invalid attachment body")
+            return DownloadedFile(
+                content=result.body,
+                content_type=result.headers.get("Content-Type", "application/octet-stream"),
+                content_disposition=result.headers.get("Content-Disposition", ""),
+            )
         except (AuthenticationError, ValueError):
             raise
         except (asyncio.TimeoutError, aiohttp.ClientError) as err:
@@ -596,18 +929,20 @@ class IServClient:
     ) -> object:
         """Perform one authenticated JSON API request."""
         try:
-            timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
-            async with self._session.request(
-                method, url, json=payload, timeout=timeout
-            ) as response:
-                self._debug_response(method, response)
-                if response.status in (401, 403) or _is_auth_redirect(response):
-                    self._authenticated = False
-                    raise AuthenticationError("Authentication required for iServ API")
-                await _raise_for_status(response)
-                if response.status == 204:
-                    return None
-                return json.loads(await _read_response_text(response))
+            result = await self._request(
+                method,
+                url,
+                json_payload=payload,
+                timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
+            )
+            if result.status in (401, 403) or _is_auth_redirect(result):
+                self._authenticated = False
+                raise AuthenticationError("Authentication required for iServ API")
+            if result.status_error is not None:
+                raise result.status_error
+            if result.status == 204:
+                return None
+            return json.loads(str(result.body or ""))
         except AuthenticationError:
             raise
         except (json.JSONDecodeError, TypeError) as err:
@@ -629,23 +964,24 @@ class IServClient:
             CannotConnect: On timeout or network error.
         """
         try:
-            timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
-            async with self._session.get(url, timeout=timeout) as response:
-                self._debug_response("GET", response)
-                if response.status in (401, 403):
-                    self._authenticated = False
-                    raise AuthenticationError(
-                        "Session expired or authentication required"
-                    )
-                if _is_auth_redirect(response):
-                    self._authenticated = False
-                    raise AuthenticationError("iServ redirected to authentication")
-                await _raise_for_status(response)
-                body = await _read_response_text(response)
-                if _is_login_page(body):
-                    self._authenticated = False
-                    raise AuthenticationError("iServ returned the login page")
-                return body
+            result = await self._request(
+                "GET",
+                url,
+                timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
+            )
+            if result.status in (401, 403):
+                self._authenticated = False
+                raise AuthenticationError("Session expired or authentication required")
+            if _is_auth_redirect(result):
+                self._authenticated = False
+                raise AuthenticationError("iServ redirected to authentication")
+            if result.status_error is not None:
+                raise result.status_error
+            body = str(result.body or "")
+            if _is_login_page(body):
+                self._authenticated = False
+                raise AuthenticationError("iServ returned the login page")
+            return body
         except (AuthenticationError, _EndpointUnavailable):
             raise
         except asyncio.TimeoutError as err:
@@ -672,21 +1008,21 @@ class IServClient:
             CannotConnect: On timeout or network error.
         """
         try:
-            timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
-            async with self._session.post(
-                url, data=payload, timeout=timeout, allow_redirects=True
-            ) as response:
-                self._debug_response("POST", response)
-                if response.status in (401, 403):
-                    self._authenticated = False
-                    raise AuthenticationError(
-                        "Session expired during form POST"
-                    )
-                if _is_auth_redirect(response):
-                    self._authenticated = False
-                    raise AuthenticationError("iServ redirected to authentication")
-                await _raise_for_status(response)
-                return True
+            result = await self._request(
+                "POST",
+                url,
+                data=payload,
+                timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
+            )
+            if result.status in (401, 403):
+                self._authenticated = False
+                raise AuthenticationError("Session expired during form POST")
+            if _is_auth_redirect(result):
+                self._authenticated = False
+                raise AuthenticationError("iServ redirected to authentication")
+            if result.status_error is not None:
+                raise result.status_error
+            return True
         except AuthenticationError:
             raise
         except asyncio.TimeoutError as err:
@@ -715,12 +1051,15 @@ class IServClient:
 
 
 def _normalize_base_url(base_url: str) -> str:
-    """Normalize an iServ base URL, including URLs ending in ``/iserv``."""
-    parsed = urlparse(base_url.rstrip("/"))
-    path = parsed.path.rstrip("/")
+    """Validate and normalize an iServ base URL."""
+    _parsed, host, port, _origin = _validated_base_url(base_url.rstrip("/"))
+    path = urlparse(base_url.rstrip("/")).path.rstrip("/")
     if path == "/iserv":
         path = ""
-    return urlunparse(parsed._replace(path=path, params="", query="", fragment="")).rstrip("/")
+    netloc = f"[{host}]" if ":" in host else host
+    if port != 443:
+        netloc += f":{port}"
+    return urlunparse(("https", netloc, path, "", "", "")).rstrip("/")
 
 
 def _week_dates(week: int | None) -> tuple[date, date]:
@@ -992,10 +1331,15 @@ def _safe_url(url: object) -> str:
     return urlunparse(parsed._replace(query="", fragment=""))
 
 
-def _is_auth_redirect(response: aiohttp.ClientResponse) -> bool:
-    """Return whether a response redirects to an iServ auth endpoint."""
-    urls = [response.url, *(item.url for item in response.history)]
-    return any("/iserv/auth/auth" in str(url) for url in urls)
+def _is_auth_redirect(response: object) -> bool:
+    """Return whether a response or collected redirect chain hit iServ auth."""
+    current = str(getattr(response, "url", ""))
+    history = getattr(response, "history", ())
+    if isinstance(response, _RequestResult):
+        urls = [current, *response.history]
+    else:
+        urls = [current, *(str(getattr(item, "url", item)) for item in history)]
+    return any("/iserv/auth/auth" in url for url in urls)
 
 
 def _is_login_page(response_body: str) -> bool:

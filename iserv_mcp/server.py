@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import stat
 import sys
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta
@@ -98,6 +99,14 @@ def _get_credentials() -> tuple[str, str, str]:
             "Set ISERV_URL, ISERV_USERNAME, and ISERV_PASSWORD before starting the server."
         )
 
+    from .client import validate_url
+
+    if not validate_url(url):
+        raise ValueError(
+            "ISERV_URL must be a safe HTTPS URL without userinfo, fragments, "
+            "local/private IPs, or local hostnames."
+        )
+
     return url, username, password
 
 
@@ -118,8 +127,7 @@ async def _get_client():
     """
     global _client, _session
 
-    import aiohttp
-    from .client import AuthenticationError, CannotConnect, IServClient
+    from .client import IServClient, create_secure_session
 
     if _client is not None and _client.is_authenticated:
         return _client
@@ -129,11 +137,11 @@ async def _get_client():
         await _session.close()
 
     url, username, password = _get_credentials()
-    _session = aiohttp.ClientSession()
+    _session = create_secure_session()
     _client = IServClient(_session, url, username, password)
     try:
         await _client.authenticate()
-    except (AuthenticationError, CannotConnect):
+    except BaseException:
         await _session.close()
         _session = None
         _client = None
@@ -381,17 +389,27 @@ async def download_parentletter_attachments(letter_uuid: str, child_uuid: str) -
             "ISERV_DOWNLOAD_DIR", "~/.local/share/iserv-mcp/attachments"
         )
     ).expanduser()
-    destination = root / _safe_path_component(letter_uuid)
-    destination.mkdir(parents=True, exist_ok=True, mode=0o700)
-
     saved: list[str] = []
-    for number, attachment in enumerate(attachments, start=1):
-        downloaded = await client.fetch_authenticated_file(attachment.href)
-        filename = _safe_path_component(attachment.filename) or f"attachment-{number}"
-        path = _unique_path(destination / filename)
-        path.write_bytes(downloaded.content)
-        path.chmod(0o600)
-        saved.append(str(path.resolve()))
+    root_fd, root_path = _open_secure_directory(root)
+    destination_fd: int | None = None
+    try:
+        destination_name = _safe_path_component(letter_uuid) or "letter"
+        destination_fd, destination = _open_secure_child_directory(
+            root_fd, destination_name, root_path
+        )
+        for number, attachment in enumerate(attachments, start=1):
+            downloaded = await client.fetch_authenticated_file(attachment.href)
+            filename = _safe_path_component(attachment.filename) or f"attachment-{number}"
+            path = _write_attachment(
+                destination_fd, filename, downloaded.content, destination
+            )
+            saved.append(str(path))
+    finally:
+        try:
+            if destination_fd is not None:
+                os.close(destination_fd)
+        finally:
+            os.close(root_fd)
 
     return "Downloaded attachments:\n" + "\n".join(f"- {path}" for path in saved)
 
@@ -494,14 +512,145 @@ def _safe_path_component(value: str) -> str:
     return re.sub(r"[^\w.() -]+", "_", value, flags=re.UNICODE).strip(" .")[:180]
 
 
-def _unique_path(path: Path) -> Path:
-    """Avoid silently overwriting an attachment with the same name."""
-    if not path.exists():
-        return path
-    for index in range(2, 10_000):
-        candidate = path.with_name(f"{path.stem}-{index}{path.suffix}")
-        if not candidate.exists():
-            return candidate
+def _directory_flags() -> int:
+    """Return flags for opening a directory without following symlinks."""
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    if not nofollow:
+        raise OSError("Atomic no-follow directory opens are not supported")
+    return os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | nofollow
+
+
+def _open_directory_at(parent_fd: int, name: str) -> int:
+    """Open an existing child directory with a symlink-safe dirfd."""
+    try:
+        fd = os.open(name, _directory_flags(), dir_fd=parent_fd)
+    except OSError as err:
+        if err.errno in (
+            getattr(os, "ELOOP", 40),
+            getattr(os, "ENOTDIR", 20),
+        ):
+            raise ValueError(
+                "Attachment directory must not be a symlink or non-directory"
+            ) from err
+        raise
+    try:
+        if not stat.S_ISDIR(os.fstat(fd).st_mode):
+            raise ValueError("Attachment destination must be a directory")
+        return fd
+    except Exception:
+        os.close(fd)
+        raise
+
+
+def _make_private_directory(fd: int) -> None:
+    """Ensure an attachment directory is private to its owner."""
+    os.fchmod(fd, 0o700)
+
+
+def _open_secure_directory(path: Path) -> tuple[int, Path]:
+    """Create/open every path component without traversing symlinks."""
+    absolute = Path(os.path.abspath(os.fspath(path)))
+    fd = os.open(absolute.anchor or os.sep, _directory_flags())
+    try:
+        for component in absolute.parts:
+            if component in (absolute.anchor, ""):
+                continue
+            try:
+                child_fd = _open_directory_at(fd, component)
+            except FileNotFoundError:
+                os.mkdir(component, 0o700, dir_fd=fd)
+                child_fd = _open_directory_at(fd, component)
+            previous_fd = fd
+            try:
+                os.close(previous_fd)
+            except BaseException:
+                try:
+                    os.close(child_fd)
+                finally:
+                    raise
+            fd = child_fd
+        _make_private_directory(fd)
+        result = (fd, absolute)
+        fd = -1
+        return result
+    except BaseException:
+        if fd >= 0:
+            os.close(fd)
+        raise
+
+
+def _open_secure_child_directory(
+    parent_fd: int, name: str, parent_path: Path
+) -> tuple[int, Path]:
+    """Create/open one attachment letter directory using the parent dirfd."""
+    if not name or name in {".", ".."} or "/" in name or "\\" in name:
+        raise ValueError("Attachment directory name is unsafe")
+    fd = -1
+    try:
+        fd = _open_directory_at(parent_fd, name)
+    except FileNotFoundError:
+        os.mkdir(name, 0o700, dir_fd=parent_fd)
+        fd = _open_directory_at(parent_fd, name)
+    try:
+        _make_private_directory(fd)
+        result = (fd, parent_path / name)
+        fd = -1
+        return result
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
+def _write_attachment(
+    destination_fd: int, filename: str, content: bytes, destination: Path
+) -> Path:
+    """Create one attachment atomically, never following or replacing a file."""
+    if not filename or filename in {".", ".."} or "/" in filename or "\\" in filename:
+        raise ValueError("Attachment filename is unsafe")
+
+    source = Path(filename)
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    if not nofollow:
+        raise OSError("Atomic no-follow file opens are not supported")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | nofollow
+    for index in range(1, 10_000):
+        candidate = filename if index == 1 else f"{source.stem}-{index}{source.suffix}"
+        fd: int | None = None
+        output = None
+        try:
+            fd = os.open(candidate, flags, 0o600, dir_fd=destination_fd)
+        except FileExistsError:
+            continue
+        except OSError as err:
+            if err.errno == getattr(os, "ELOOP", 40):
+                raise ValueError("Attachment filename must not be a symlink") from err
+            raise
+
+        try:
+            os.fchmod(fd, 0o600)
+            output = os.fdopen(fd, "wb")
+            fd = None
+            with output:
+                output.write(content)
+                output.flush()
+                os.fsync(output.fileno())
+            return destination / candidate
+        except Exception:
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            if output is not None:
+                try:
+                    output.close()
+                except OSError:
+                    pass
+            try:
+                os.unlink(candidate, dir_fd=destination_fd)
+            except FileNotFoundError:
+                pass
+            raise
     raise RuntimeError("Could not allocate a unique attachment filename")
 
 

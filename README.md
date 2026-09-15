@@ -109,10 +109,10 @@ mcp_servers:
 Restart Hermes after changing `config.yaml`. Tools are registered with names
 such as `mcp_iserv_get_parentletters`.
 
-For Hermi and James, install the same package on each host and create a separate
-local credential file there. This avoids exposing the MCP server or credentials
-over the LAN. A shared HTTP deployment would need its own authentication and is
-therefore deliberately not the default.
+For multiple agents or hosts, install the package separately on each host and
+create a separate local credential file there. This avoids exposing the MCP
+server or credentials over the LAN. A shared HTTP deployment would need its own
+authentication and is therefore deliberately not the default.
 
 ## Design notes
 

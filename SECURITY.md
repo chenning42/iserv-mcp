@@ -9,6 +9,6 @@ this repository. Do not disclose security issues in a public issue. Revoke
 affected credentials and terminate active iServ sessions if a secret may have
 leaked.
 
-This unofficial client uses private web endpoints that can change without
-notice. Keep deployments local and do not expose the stdio server through an
-unauthenticated network bridge.
+This unofficial client relies on undocumented internal iServ web APIs that may
+change without notice. Run the MCP server locally through stdio. Do not expose
+it through an unauthenticated HTTP or network bridge.

@@ -14,7 +14,7 @@ import os
 import re
 import sys
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 
@@ -55,7 +55,9 @@ mcp = FastMCP(
         "get_parentletters (overview list), "
         "get_parentletter_detail (full text and attachment list), "
         "download_parentletter_attachments (save attachments locally), "
-        "mark_parentletter_read (explicit write action)."
+        "mark_parentletter_read (explicit write action), "
+        "get_sick_note_children (read available children), "
+        "submit_sick_note (preview by default; explicit confirmed write)."
     ),
     lifespan=_lifespan,
 )
@@ -415,6 +417,76 @@ async def mark_parentletter_read(
         return "Not changed: no mark-as-read CSRF token was found on the detail page."
     await client.mark_parentletter_read(letter_uuid, child_uuid, token)
     return "Parent letter was marked as read."
+
+
+@mcp.tool()
+async def get_sick_note_children() -> str:
+    """List children for whom the logged-in guardian may submit a sick note."""
+    client = await _get_client()
+    children = await client.fetch_sick_note_children()
+    if not children:
+        return "No children are available for sick notes."
+    lines = ["## Children available for sick notes", "", "| ID | Child | Class |", "| --- | --- | --- |"]
+    for child in children:
+        course = child.get("mainCourse")
+        class_name = course.get("name", "—") if isinstance(course, dict) else "—"
+        lines.append(f"| `{child.get('id', '')}` | {child.get('displayname', '—')} | {class_name} |")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def submit_sick_note(
+    child_id: int,
+    sick_from: str,
+    sick_until: str,
+    from_lesson: int = 1,
+    until_lesson: int = 7,
+    duty_to_report: bool = False,
+    comment: str = "",
+    confirmed: bool = False,
+) -> str:
+    """Preview or submit a sick note for one child; confirmed must explicitly be true.
+
+    Dates must use YYYY-MM-DD. Use get_sick_note_children first. The selected
+    child is verified against the guardian's live child list before submission.
+    """
+    try:
+        start = date.fromisoformat(sick_from)
+        end = date.fromisoformat(sick_until)
+    except ValueError:
+        return "Not submitted: sick_from and sick_until must use YYYY-MM-DD."
+    if end < start:
+        return "Not submitted: sick_until must not be before sick_from."
+    if not 1 <= from_lesson <= until_lesson <= 20:
+        return "Not submitted: lesson numbers must satisfy 1 <= from_lesson <= until_lesson <= 20."
+
+    client = await _get_client()
+    children = await client.fetch_sick_note_children()
+    child = next((item for item in children if item.get("id") == child_id), None)
+    if child is None:
+        return "Not submitted: child_id is not available to this guardian account."
+
+    name = str(child.get("displayname", child_id))
+    preview = (
+        f"Sick note for {name}: {start.isoformat()} lesson {from_lesson} through "
+        f"{end.isoformat()} lesson {until_lesson}; duty_to_report={duty_to_report}; "
+        f"comment={'yes' if comment.strip() else 'no'}."
+    )
+    if not confirmed:
+        return f"PREVIEW ONLY — nothing submitted. {preview} Call again with confirmed=true to submit."
+
+    payload: dict[str, object] = {
+        "sickUser": child_id,
+        "sickFromDate": start.isoformat(),
+        "sickTillDate": end.isoformat(),
+        "isDutyToReport": duty_to_report,
+        "sickFromLessonNumber": from_lesson,
+        "sickTillLessonNumber": until_lesson,
+    }
+    if comment.strip():
+        payload["note"] = comment.strip()
+    await client.submit_sick_note(payload)
+    return f"Submitted. {preview}"
 
 
 def _safe_path_component(value: str) -> str:

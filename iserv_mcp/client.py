@@ -100,6 +100,8 @@ class IServClient:
     CURRENT_TIMETABLE_PATH = "/iserv/dieschulapp/api/1.0/current-timetable/"
     TIMETABLE_PATH = "/iserv/plan/show/raw"
     TIMETABLE_DATA_PATH = "/iserv/timetable/data"
+    SICK_NOTE_CHILDREN_PATH = "/iserv/dieschulapp/api/1.0/sickNotes/userSelection/"
+    SICK_NOTES_PATH = "/iserv/dieschulapp/api/1.0/sickNotes/"
 
     def __init__(
         self,
@@ -562,6 +564,56 @@ class IServClient:
             raise
         except (asyncio.TimeoutError, aiohttp.ClientError) as err:
             raise CannotConnect(f"Could not download iServ attachment: {err}") from err
+
+    async def fetch_sick_note_children(self) -> list[dict[str, object]]:
+        """Return children for whom the authenticated guardian may file sick notes."""
+        url = f"{self._base_url}{self.SICK_NOTE_CHILDREN_PATH}"
+        try:
+            result = await self._do_json_request("GET", url)
+        except AuthenticationError:
+            await self.authenticate()
+            result = await self._do_json_request("GET", url)
+        if not isinstance(result, list) or not all(isinstance(item, dict) for item in result):
+            raise CannotConnect("iServ returned an unexpected sick-note child list")
+        return result
+
+    async def submit_sick_note(self, payload: dict[str, object]) -> dict[str, object]:
+        """Create one sick note through the verified DieSchulApp guardian API."""
+        url = f"{self._base_url}{self.SICK_NOTES_PATH}"
+        try:
+            result = await self._do_json_request("POST", url, payload)
+        except AuthenticationError:
+            await self.authenticate()
+            result = await self._do_json_request("POST", url, payload)
+        if result is None:
+            return {}
+        if not isinstance(result, dict):
+            raise CannotConnect("iServ returned an unexpected sick-note response")
+        return result
+
+    async def _do_json_request(
+        self, method: str, url: str, payload: dict[str, object] | None = None
+    ) -> object:
+        """Perform one authenticated JSON API request."""
+        try:
+            timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
+            async with self._session.request(
+                method, url, json=payload, timeout=timeout
+            ) as response:
+                self._debug_response(method, response)
+                if response.status in (401, 403) or _is_auth_redirect(response):
+                    self._authenticated = False
+                    raise AuthenticationError("Authentication required for iServ API")
+                await _raise_for_status(response)
+                if response.status == 204:
+                    return None
+                return json.loads(await _read_response_text(response))
+        except AuthenticationError:
+            raise
+        except (json.JSONDecodeError, TypeError) as err:
+            raise CannotConnect("iServ returned invalid JSON") from err
+        except (asyncio.TimeoutError, aiohttp.ClientError) as err:
+            raise CannotConnect(f"iServ API request failed: {err}") from err
 
     async def _do_fetch_page(self, url: str) -> str:
         """GET a page and return its text, raising on auth/connect failures.

@@ -16,6 +16,8 @@ can differ; test against your school installation before relying on it.
 | `get_parentletter_detail` | Read full text, metadata and attachment names | No |
 | `download_parentletter_attachments` | Save all attachments locally | No |
 | `mark_parentletter_read` | Mark a letter as read; requires `confirmed=true` | **Yes** |
+| `get_sick_note_children` | List children available for guardian sick notes | No |
+| `submit_sick_note` | Preview or submit a per-child sick note; requires `confirmed=true` to write | **Yes** |
 | `get_full_schedule` | Read the current or next timetable week | No |
 | `get_schedule_for_day` | Read one timetable day | No |
 
@@ -120,8 +122,8 @@ therefore deliberately not the default.
 - `mark_parentletter_read` is separated from read tools and requires an explicit
   confirmation argument.
 - Attachments remain on the MCP host and are never uploaded automatically.
-- The absence/illness module is not implemented yet because its endpoints and
-  form fields must be verified against the concrete school installation first.
+- Sick notes use the verified DieSchulApp guardian API. The server validates the
+  selected child against the live guardian child list and defaults to preview-only.
 
 ## Attribution and license
 

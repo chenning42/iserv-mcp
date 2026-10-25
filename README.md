@@ -1,5 +1,7 @@
 # iServ MCP
 
+<!-- mcp-name: io.github.chenning42/iserv-mcp -->
+
 Unofficial, standalone [Model Context Protocol](https://modelcontextprotocol.io/)
 server for iServ school portals. It retrieves parent letters, their full text
 and attachments, and can explicitly mark letters as read. Timetable tools from
@@ -29,8 +31,16 @@ use `0600`.
 
 Python 3.11 or newer is required.
 
+Quickest way, without cloning (needs [uv](https://docs.astral.sh/uv/)):
+
 ```bash
-git clone <repository-url> iserv-mcp
+uvx --from git+https://github.com/chenning42/iserv-mcp iserv-mcp
+```
+
+Or from a checkout:
+
+```bash
+git clone https://github.com/chenning42/iserv-mcp.git
 cd iserv-mcp
 python -m venv .venv
 .venv/bin/pip install .
@@ -90,6 +100,21 @@ Optional flags:
 
 The default download directory is
 `~/.local/share/iserv-mcp/attachments`.
+
+## Other MCP clients (Claude Desktop, Cursor, ...)
+
+```json
+{
+  "mcpServers": {
+    "iserv": {
+      "command": "uvx",
+      "args": ["--from", "git+https://github.com/chenning42/iserv-mcp", "iserv-mcp"]
+    }
+  }
+}
+```
+
+Credentials are read from `~/.config/iserv-mcp/credentials.json` (see above).
 
 ## Hermes configuration
 

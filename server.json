@@ -1,0 +1,16 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.chenning42/iserv-mcp",
+  "title": "iServ MCP",
+  "description": "Unofficial MCP server for iServ school portals: parent letters, attachments, timetables and guardian sick notes.",
+  "repository": {"url": "https://github.com/chenning42/iserv-mcp", "source": "github"},
+  "version": "0.1.0",
+  "packages": [
+    {
+      "registryType": "pypi",
+      "identifier": "iserv-mcp",
+      "version": "0.1.0",
+      "transport": {"type": "stdio"}
+    }
+  ]
+}
